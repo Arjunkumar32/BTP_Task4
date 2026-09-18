@@ -1,5 +1,5 @@
 """
-TASK 4 — Indian-Context Relevance & Evidence Prioritization
+TASK 4 - Indian-Context Relevance & Evidence Prioritization
 =============================================================
 
 Implements the callable API required by the project spec:
@@ -8,29 +8,53 @@ Implements the callable API required by the project spec:
 
 Pipeline (per Appendix A pseudocode):
     1. validate_inputs
-    2. lexical_relevance      (TF-IDF cosine — Layer A)
-    3. semantic_relevance     (character n-gram TF-IDF cosine — placeholder
-                               for a real multilingual embedding model such
-                               as BGE-M3 / Sentence-Transformers; swap it in
-                               behind `encode()` once internet/model weights
-                               are available)
+    2. lexical_relevance      (word TF-IDF cosine - Layer A)
+    3. semantic_relevance     (BAAI/bge-m3 multilingual dense embeddings,
+                               cosine similarity - Layer B)
     4. compute_indian_context (script + entity + place + institution +
                                primary-text + vocabulary + query-conditioned
                                match)
     5. compute_source_signal  (source type, attribution, date, citations,
                                OCR confidence, corroboration/duplication)
     6. normalize_features     (clip to [0,1])
-    7. combine_scores         (configurable weighted sum, default 50/30/20)
+    7. combine_scores         (configurable weighted sum)
     8. sort + rank + return top_k
 
-No external model downloads are required — everything below runs with
-numpy + scikit-learn only, so it is a fully offline, runnable baseline
-(Phase 1–4 of the roadmap). Swap in a real multilingual sentence-embedding
-model later by replacing `semantic_relevance()` without touching anything
-else (that's the whole point of the encoder interface in the spec).
+Hybrid query relevance
+----------------------
+    QueryRelevance = 0.30 * LexicalScore + 0.70 * BGE_M3Score
+
+Layer B is BAAI/bge-m3, a multilingual *dense embedding* model
+(XLM-RoBERTa backbone, 1024-d) served through `sentence-transformers`.
+It projects Hindi, English and code-mixed Hindi-English text into a single
+shared vector space, so a Devanagari query can match an English passage on
+meaning rather than on surface form. Embeddings are L2-normalized, which
+makes cosine similarity a plain dot product.
+
+Layer A (word-level TF-IDF) is deliberately kept alongside it. Dense
+embeddings generalize across paraphrase and script but blur exact surface
+forms; lexical overlap still pins down what must match literally - named
+entities, person and place names, dates, numbers, acronyms and technical
+terms (e.g. "ASI", "1998", "Chandrayaan"). The 30/70 split keeps that
+literal anchor without letting it dominate the semantic signal.
+
+Model loading
+-------------
+The encoder is loaded lazily - never at import time - and cached for the
+lifetime of the process, so it is initialized once and reused across every
+call to `rank_evidence()`. Importing this module performs no network
+access and no model load.
+
+If `sentence-transformers` or the model weights are unavailable, semantic
+scoring raises `SemanticModelUnavailableError` with install/download
+instructions. It does not silently fall back to a weaker similarity
+measure (an earlier revision of this file used character n-gram TF-IDF as
+an offline stand-in; that placeholder has been removed).
 """
 
 from __future__ import annotations
+import copy
+import os
 import re
 import math
 import unicodedata
@@ -90,7 +114,11 @@ SOURCE_TYPE_PRIOR = {
 }
 
 DEFAULT_CONFIG = {
+    # QueryRelevance = 0.30 * lexical TF-IDF + 0.70 * BGE-M3 dense cosine
     "relevance_weights": {"lexical_weight": 0.30, "semantic_weight": 0.70},
+    # Layer B encoder. device=None lets sentence-transformers choose
+    # (CUDA when available, otherwise CPU).
+    "semantic_model": {"name": "BAAI/bge-m3", "batch_size": 16, "device": None},
     "context_weights": {
         "w_script": 0.15, "w_entity": 0.20, "w_place": 0.15,
         "w_institution": 0.15, "w_primary": 0.15, "w_vocab": 0.10,
@@ -118,6 +146,22 @@ def validate_inputs(query: str, passages: list[dict]) -> None:
     for p in passages:
         if "passage_id" not in p:
             raise ValueError("every passage needs a passage_id")
+
+
+def merge_config(base: dict, override: Optional[dict]) -> dict:
+    """Recursively merge `override` onto a deep copy of `base`.
+
+    A partial config only replaces the keys it actually names: unrelated
+    DEFAULT_CONFIG sections - and unrelated keys *inside* a named section -
+    survive untouched. `base` is never mutated.
+    """
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def _clip01(x: float) -> float:
@@ -156,32 +200,172 @@ def lexical_relevance(query: str, passages: list[dict]) -> np.ndarray:
     return _tfidf_cosine(query, texts, analyzer="word", ngram_range=(1, 1))
 
 
-def semantic_relevance(query: str, passages: list[dict]) -> np.ndarray:
-    """
-    Layer B — multilingual semantic similarity.
+# --- Layer B: BAAI/bge-m3 multilingual dense embeddings ----------------
 
-    NOTE: The spec asks for a multilingual sentence-embedding model
-    (Sentence-Transformers / BGE-M3). Downloading model weights needs
-    internet access to a model hub, which this environment does not have.
-    As a fully offline, swappable stand-in we use character n-gram TF-IDF
-    cosine similarity, which partially tolerates spelling/script noise
-    (e.g. Roman Hindi vs Devanagari share some substrings via
-    transliteration) far better than pure word overlap. Replace this
-    function's body with a real `encoder.encode(...)` call and cosine
-    similarity once a model is available — nothing else in the pipeline
-    needs to change (this is exactly why the spec asks for an encoder
-    interface).
+class SemanticModelUnavailableError(RuntimeError):
+    """Raised when the BGE-M3 encoder cannot be imported or loaded."""
+
+
+_MODEL_HELP = """Could not load the multilingual semantic encoder {name!r}.
+Reason: {reason}
+
+How to fix:
+  1. Install the runtime:
+       pip install -r requirements.txt
+       (or: pip install "sentence-transformers>=2.7" torch)
+  2. Download the weights once (~2.2 GB, needs internet):
+       python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
+       (or: hf download BAAI/bge-m3)
+  3. Offline / air-gapped machine: copy the HuggingFace cache directory
+     (~/.cache/huggingface/hub) from a machine that already has the model,
+     or point config['semantic_model']['name'] at a local directory.
+
+Semantic relevance is a required component of this pipeline, so it will
+not silently fall back to a weaker similarity measure."""
+
+# Process-wide singleton: loaded on first use, then reused by every
+# subsequent rank_evidence() call.
+_SEMANTIC_MODEL = None
+_SEMANTIC_MODEL_KEY = None
+
+
+def _semantic_model_config(model_config: Optional[dict] = None) -> dict:
+    """Overlay a partial semantic-model config on the defaults."""
+    return {**DEFAULT_CONFIG["semantic_model"], **(model_config or {})}
+
+
+def _get_semantic_model(model_config: Optional[dict] = None):
+    """Lazily load the BGE-M3 encoder once, then reuse it.
+
+    `sentence_transformers` is imported *inside* this function so that
+    importing this module never triggers a torch import, a model load or a
+    network request.
+    """
+    global _SEMANTIC_MODEL, _SEMANTIC_MODEL_KEY
+
+    cfg = _semantic_model_config(model_config)
+    name, device = cfg["name"], cfg.get("device")
+    key = (name, device)
+    if _SEMANTIC_MODEL is not None and _SEMANTIC_MODEL_KEY == key:
+        return _SEMANTIC_MODEL
+
+    # This pipeline is torch-only. Tell transformers not to probe for
+    # TensorFlow / Flax backends: importing them is pure startup cost here,
+    # and a stale TF build in the environment would abort the import
+    # outright. setdefault, so an explicit USE_TF from the caller wins.
+    os.environ.setdefault("USE_TF", "0")
+    os.environ.setdefault("USE_FLAX", "0")
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as exc:  # not installed, or a broken torch install
+        raise SemanticModelUnavailableError(_MODEL_HELP.format(
+            name=name,
+            reason="sentence-transformers is not importable (%s: %s)"
+                   % (type(exc).__name__, exc),
+        )) from exc
+
+    try:
+        model = SentenceTransformer(name, device=device)
+    except Exception as exc:  # weights missing, offline, bad name, OOM, ...
+        raise SemanticModelUnavailableError(_MODEL_HELP.format(
+            name=name,
+            reason="loading the model failed (%s: %s)"
+                   % (type(exc).__name__, exc),
+        )) from exc
+
+    _SEMANTIC_MODEL = model
+    _SEMANTIC_MODEL_KEY = key
+    return model
+
+
+def semantic_relevance(query: str, passages: list[dict],
+                       model_config: Optional[dict] = None) -> np.ndarray:
+    """
+    Layer B - multilingual semantic similarity via BAAI/bge-m3.
+
+    BGE-M3 is a multilingual dense embedding model: the query and every
+    passage are encoded into one shared 1024-d space, so Hindi, English and
+    code-mixed Hindi-English text are directly comparable and a match no
+    longer depends on shared surface strings.
+
+    Query and passages are encoded in batches (`batch_size`), embeddings are
+    L2-normalized, and each score is the cosine similarity - a dot product
+    on unit vectors - between the query and that passage.
+
+    Returns one score per passage, in the order the passages were given.
+    Passages whose text is empty or whitespace-only are never sent to the
+    encoder and score exactly 0.0; if every passage is empty the encoder is
+    not loaded at all.
     """
     texts = [_text_of(p) for p in passages]
-    return _tfidf_cosine(query, texts, analyzer="char_wb", ngram_range=(2, 4))
+    scores = np.zeros(len(texts), dtype=float)
+
+    filled = [i for i, t in enumerate(texts) if t]
+    if not filled:
+        return scores
+
+    cfg = _semantic_model_config(model_config)
+    model = _get_semantic_model(cfg)
+    batch_size = max(1, int(cfg.get("batch_size") or 16))
+
+    embeddings = model.encode(
+        [query] + [texts[i] for i in filled],
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    scores[filled] = embeddings[1:] @ embeddings[0]
+    return scores
 
 
-def score_query_relevance(query: str, passages: list[dict], weights: dict) -> np.ndarray:
-    lex = lexical_relevance(query, passages)
-    sem = semantic_relevance(query, passages)
-    lex = np.clip(lex, 0, 1)
-    sem = np.clip(sem, 0, 1)
-    combined = weights["lexical_weight"] * lex + weights["semantic_weight"] * sem
+def validate_relevance_weights(weights: dict) -> dict:
+    """Validate and normalize the hybrid relevance weights.
+
+    Both weights must be present, finite and non-negative, and must sum to
+    strictly more than zero. Weights that do not already sum to 1 are
+    normalized internally, so e.g. {3, 7} behaves exactly like {0.3, 0.7}.
+    """
+    if not isinstance(weights, dict):
+        raise ValueError(
+            "relevance_weights must be a dict with 'lexical_weight' and "
+            "'semantic_weight'")
+    try:
+        lex = float(weights["lexical_weight"])
+        sem = float(weights["semantic_weight"])
+    except KeyError as exc:
+        raise ValueError("relevance_weights is missing key %s" % exc) from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError("relevance weights must be numbers") from exc
+
+    if not (math.isfinite(lex) and math.isfinite(sem)):
+        raise ValueError("relevance weights must be finite numbers")
+    if lex < 0 or sem < 0:
+        raise ValueError(
+            "relevance weights must be non-negative (got lexical_weight=%r, "
+            "semantic_weight=%r)" % (lex, sem))
+
+    total = lex + sem
+    if total <= 0:
+        raise ValueError("relevance weights must sum to more than zero")
+    if not math.isclose(total, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+        lex, sem = lex / total, sem / total
+    return {"lexical_weight": lex, "semantic_weight": sem}
+
+
+def score_query_relevance(query: str, passages: list[dict], weights: dict,
+                          model_config: Optional[dict] = None) -> np.ndarray:
+    """QueryRelevance = lexical_weight * TF-IDF + semantic_weight * BGE-M3."""
+    w = validate_relevance_weights(weights)
+    lex = np.clip(lexical_relevance(query, passages), 0, 1)
+    if w["semantic_weight"] > 0:
+        sem = np.clip(semantic_relevance(query, passages, model_config), 0, 1)
+    else:
+        # lexical-only configs (e.g. the A1 ablation) must not pay to load a
+        # 2 GB encoder whose contribution is multiplied by zero
+        sem = np.zeros_like(lex)
+    combined = w["lexical_weight"] * lex + w["semantic_weight"] * sem
     return np.clip(combined, 0, 1)
 
 
@@ -315,13 +499,16 @@ def combine_scores(features: dict, ranking_weights: dict) -> float:
 def rank_evidence(query: str, passages: list[dict], top_k: Optional[int] = None,
                    config: Optional[dict] = None) -> list[dict]:
     """Return ranked evidence with interpretable feature scores."""
-    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    cfg = merge_config(DEFAULT_CONFIG, config)
     validate_inputs(query, passages)
+    # fail fast on bad weights, before any encoder is loaded
+    cfg["relevance_weights"] = validate_relevance_weights(cfg["relevance_weights"])
 
     if not passages:
         return []
 
-    query_rel = score_query_relevance(query, passages, cfg["relevance_weights"])
+    query_rel = score_query_relevance(query, passages, cfg["relevance_weights"],
+                                      cfg["semantic_model"])
 
     texts = [_text_of(p) for p in passages]
     # pairwise similarity for duplication/corroboration detection

@@ -33,9 +33,16 @@ real annotated file once your teammate produces it; nothing else changes.
 """
 from __future__ import annotations
 import json
+import os
 import sys
 from collections import defaultdict
 from statistics import mean
+
+# Make the project root importable so that `python evaluation/evaluate.py ...`
+# works from the project root, not just `python -m evaluation.evaluate`.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import numpy as np
 from scipy.stats import spearmanr

@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights are NOT vendored: BAAI/bge-m3 (~2.2 GB) is downloaded on
+# first use into the HuggingFace cache (~/.cache/huggingface/hub).
+*.bin
+*.safetensors

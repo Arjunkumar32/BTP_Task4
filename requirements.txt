@@ -1,0 +1,24 @@
+# Task 4 - Indian-Context Relevance & Evidence Prioritization
+#
+# Install:  pip install -r requirements.txt
+#
+# The semantic layer additionally needs the BAAI/bge-m3 weights (~2.2 GB).
+# They download automatically on first use, or fetch them ahead of time:
+#     python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
+
+# --- core pipeline ---------------------------------------------------
+numpy>=1.24
+# TF-IDF (lexical relevance) + char n-gram duplicate detection.
+# >=1.5 is required for the NumPy 2.x ABI; older builds fail to import.
+scikit-learn>=1.5
+
+# --- Layer B: multilingual dense embeddings (BAAI/bge-m3) ------------
+sentence-transformers>=2.7
+torch>=2.0
+
+# --- evaluation ------------------------------------------------------
+scipy>=1.10          # evaluation/evaluate.py: Spearman rank correlation
+optuna>=3.0          # evaluation/optimize_weights.py only
+
+# --- tests -----------------------------------------------------------
+pytest>=7.0
