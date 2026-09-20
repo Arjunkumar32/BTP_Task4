@@ -54,8 +54,10 @@ an offline stand-in; that placeholder has been removed).
 
 from __future__ import annotations
 import copy
+import json
 import os
 import re
+import sys
 import math
 import unicodedata
 from datetime import datetime, date
@@ -566,91 +568,53 @@ def rank_evidence(query: str, passages: list[dict], top_k: Optional[int] = None,
 
 
 # ----------------------------------------------------------------------
-# 7. Demo — mirrors the testing matrix in Section 16 of the spec
+# 7. Command-line runner for the annotated JSONL dataset
 # ----------------------------------------------------------------------
 
+def load_jsonl_dataset(path: str) -> dict[str, dict]:
+    """Load and group annotated JSONL rows by query_id."""
+    grouped: dict[str, dict] = {}
+    with open(path, "r", encoding="utf-8") as dataset_file:
+        for line_number, line in enumerate(dataset_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_number} of {path}: {exc}") from exc
+
+            query_id = row["query_id"]
+            if query_id not in grouped:
+                grouped[query_id] = {"query": row["query"], "passages": []}
+            grouped[query_id]["passages"].append({
+                "passage_id": row["passage_id"],
+                "text": row.get("text", ""),
+                "source_metadata": row.get("source_metadata", {}),
+                "extraction_metadata": row.get("extraction_metadata", {}),
+            })
+    return grouped
+
+
+def print_dataset_rankings(dataset_path: str) -> None:
+    """Rank and print every query group in an annotated JSONL dataset."""
+    grouped = load_jsonl_dataset(dataset_path)
+    print(f"Dataset: {dataset_path}")
+    print(f"Queries: {len(grouped)}")
+
+    for query_id, data in grouped.items():
+        ranked = rank_evidence(data["query"], data["passages"])
+        print(f"\n{query_id}: {data['query']}")
+        header = f"{'Rank':<6}{'Passage ID':<14}{'QueryRel':<10}{'IndiaCtx':<10}{'Evidence':<10}{'Final':<8}"
+        print(header)
+        print("-" * len(header))
+        for result in ranked:
+            print(f"{result['rank']:<6}{result['passage_id']:<14}{result['query_relevance']:<10}"
+                  f"{result['indian_context_relevance']:<10}{result['source_signal']:<10}"
+                  f"{result['final_score']:<8}")
+
+
 if __name__ == "__main__":
-    query = "राम अयोध्या से जुड़ी प्राचीन जानकारी"  # "ancient information related to Rama and Ayodhya"
-
-    passages = [
-        {  # Indian scholarly Hindi source — should rank near top
-            "passage_id": "S1-P01",
-            "text": "अयोध्या में राम के जन्मस्थान से जुड़े पुरातात्विक साक्ष्य रामायण की परंपरा से मेल खाते हैं। "
-                    "यह शोध भारतीय पुरातत्व सर्वेक्षण (ASI) द्वारा प्रकाशित किया गया।",
-            "language": "hi", "script": "Devanagari",
-            "source_metadata": {"url": "https://asi.nic.in/report", "author": "Dr. R. Sharma",
-                                 "organization": "Archaeological Survey of India",
-                                 "source_type": "academic", "publication_date": "2023-02-10",
-                                 "has_citations": True},
-        },
-        {  # strong external academic English source — corroborating
-            "passage_id": "S2-P01",
-            "text": "Archaeological excavations near Ayodhya have documented occupation layers consistent "
-                    "with the historical narrative associated with Rama in the Ramayana epic.",
-            "language": "en",
-            "source_metadata": {"url": "https://cambridge.org/journal", "author": "J. Smith",
-                                 "source_type": "academic", "publication_date": "2021-06-01",
-                                 "has_citations": True},
-        },
-        {  # scanned Sanskrit/Hindi page via OCR — high context, medium evidence
-            "passage_id": "S3-P12",
-            "text": "प्राचीन ग्रन्थ के अनुसार अयोध्या नगरी राम की जन्मभूमि रही है, यह वेदों में भी वर्णित है।",
-            "language": "hi", "script": "Devanagari",
-            "source_metadata": {"source_type": "manuscript", "publication_date": "1998-01-01"},
-            "extraction_metadata": {"method": "ocr", "ocr_confidence": 0.62, "page_number": 45},
-        },
-        {  # anonymous high-overlap blog — near duplicate of passage below, weak evidence
-            "passage_id": "S4-P02",
-            "text": "Ayodhya is the birthplace of Rama according to the Ramayana, an ancient Indian epic.",
-            "language": "en",
-            "source_metadata": {"source_type": "blog"},
-        },
-        {  # exact-copy duplicate of S4-P02 — should be down-weighted for corroboration
-            "passage_id": "S4-P03",
-            "text": "Ayodhya is the birthplace of Rama according to the Ramayana, an ancient Indian epic.",
-            "language": "en",
-            "source_metadata": {"source_type": "blog"},
-        },
-        {  # "India mention trap" — contains India-related word but irrelevant to query
-            "passage_id": "S5-P01",
-            "text": "India's IT exports grew significantly in 2023 due to demand for Python-based backend "
-                    "services and cloud computing.",
-            "language": "en",
-            "source_metadata": {"source_type": "news", "publication_date": "2023-11-01"},
-        },
-        {  # completely irrelevant passage — should rank lowest
-            "passage_id": "S6-P01",
-            "text": "The weather today is sunny with a chance of light rain in the evening.",
-            "language": "en",
-            "source_metadata": {"source_type": "blog"},
-        },
-        {  # missing metadata entirely — must not crash, gets neutral defaults
-            "passage_id": "S7-P01",
-            "text": "Ram Mandir construction in Ayodhya was completed after decades of legal proceedings.",
-            "language": "en",
-        },
-    ]
-
-    ranked = rank_evidence(query, passages, top_k=None,
-                            config={"output": {"include_feature_breakdown": True, "include_provenance": False}})
-
-    print(f"Query: {query}\n")
-    header = f"{'Rank':<5}{'Passage ID':<12}{'QueryRel':<10}{'IndiaCtx':<10}{'Evidence':<10}{'Final':<8}"
-    print(header)
-    print("-" * len(header))
-    for r in ranked:
-        print(f"{r['rank']:<5}{r['passage_id']:<12}{r['query_relevance']:<10}"
-              f"{r['indian_context_relevance']:<10}{r['source_signal']:<10}{r['final_score']:<8}")
-
-    print("\nDetailed breakdown for the top-ranked passage:")
-    top = ranked[0]
-    print(f"  passage_id: {top['passage_id']}")
-    print(f"  text: {top['text'][:80]}...")
-    print(f"  final_score: {top['final_score']}")
-    print(f"  feature_breakdown: {top['feature_breakdown']}")
-
-    print("\nNote on duplicates (S4-P02 vs S4-P03) — duplication_score should be < 1.0 for both:")
-    for r in ranked:
-        if r["passage_id"] in ("S4-P02", "S4-P03"):
-            print(f"  {r['passage_id']}: duplication_score = "
-                  f"{r['feature_breakdown']['evidence']['duplication_score']}")
+    default_dataset = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "evaluation", "sample_dataset.jsonl")
+    dataset_path = sys.argv[1] if len(sys.argv) > 1 else default_dataset
+    print_dataset_rankings(dataset_path)
