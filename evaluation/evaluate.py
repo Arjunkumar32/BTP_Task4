@@ -148,7 +148,8 @@ def print_report(summary: dict) -> None:
 
 
 if __name__ == "__main__":
-    dataset_path = sys.argv[1] if len(sys.argv) > 1 else "sample_dataset.jsonl"
+    dataset_path = (sys.argv[1] if len(sys.argv) > 1
+                    else os.path.join(_ROOT, "evaluation", "sample_dataset.jsonl"))
     grouped = load_dataset(dataset_path)
     result = evaluate_ranker(grouped)
     print_report(result)
